@@ -1,6 +1,7 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Rate, Trend, Counter } from 'k6/metrics';
+import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
 
 // Métricas personalizadas
 const errorRate = new Rate('errors');
@@ -27,7 +28,7 @@ export const options = {
   },
 };
 
-const BASE_URL = __ENV.API_URL || 'http://localhost:8080';
+const BASE_URL = __ENV.API_URL || 'http://localhost:8088';
 
 export default function () {
   // Simular tráfico real: 60% lecturas, 30% creación, 10% updates

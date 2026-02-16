@@ -1,17 +1,19 @@
 -- Top 10 productos por sucursal en el último mes
+EXPLAIN ANALYZE
 SELECT 
-    branch_id,
-    product_id,
-    SUM(quantity) as total_sold,
-    SUM(total) as revenue
+    o.branch_id,
+    p.name,
+    SUM(oi.quantity * oi.price) AS total_sales
 FROM orders o
 JOIN order_items oi ON o.id = oi.order_id
-WHERE created_at >= NOW() - INTERVAL '1 month'
-GROUP BY branch_id, product_id
-ORDER BY revenue DESC
+JOIN products p ON p.id = oi.product_id
+WHERE o.created_at >= NOW() - INTERVAL '1 month'
+GROUP BY o.branch_id, p.name
+ORDER BY total_sales DESC
 LIMIT 10;
 
 -- Análisis de tendencias por hora del día
+EXPLAIN ANALYZE
 SELECT 
     EXTRACT(HOUR FROM created_at) as hour_of_day,
     COUNT(*) as order_count,
@@ -22,6 +24,7 @@ GROUP BY EXTRACT(HOUR FROM created_at)
 ORDER BY hour_of_day;
 
 -- Reporte de ingresos diarios por categoría
+EXPLAIN ANALYZE
 SELECT 
     DATE(o.created_at) as date,
     c.name as category,

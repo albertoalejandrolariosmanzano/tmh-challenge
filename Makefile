@@ -21,8 +21,8 @@ logs-api: ## Ver logs solo de la API
 
 test: ## Ejecutar tests básicos
 	@echo "🧪 Ejecutando smoke tests..."
-	@curl -s http://localhost:8080/health || echo "❌ API no responde"
-	@curl -s http://localhost:8080/ready || echo "❌ Readiness check falló"
+	@curl -s http://localhost:8088/health || echo "❌ API no responde"
+	@curl -s http://localhost:8088/ready || echo "❌ Readiness check falló"
 	@curl -s http://localhost:9090/-/healthy || echo "❌ Prometheus no responde"
 
 load-data: ## Cargar 500k órdenes (toma ~8-10 minutos)
@@ -54,18 +54,18 @@ restart-api: ## Reiniciar solo la API
 	docker-compose restart api
 
 k6-test: ## Ejecutar load test con K6
-	k6 run tests/k6-script.js
+	k6 run test/k6.js
 
 metrics: ## Ver métricas en tiempo real
 	@echo "📊 Métricas disponibles en:"
 	@echo "   Prometheus: http://localhost:9090"
 	@echo "   Grafana:    http://localhost:3000 (admin/admin)"
-	@echo "   API Metrics: http://localhost:8080/metrics"
+	@echo "   API Metrics: http://localhost:8088/metrics"
 
 status: ## Ver estado de servicios
 	@docker-compose ps
 	@echo ""
 	@echo "🔍 Health Checks:"
-	@curl -s http://localhost:8080/health && echo "✅ API Health OK" || echo "❌ API Health FAIL"
-	@curl -s http://localhost:8080/ready && echo "✅ API Ready OK" || echo "❌ API Ready FAIL"
+	@curl -s http://localhost:8088/health && echo "✅ API Health OK" || echo "❌ API Health FAIL"
+	@curl -s http://localhost:8088/ready && echo "✅ API Ready OK" || echo "❌ API Ready FAIL"
     

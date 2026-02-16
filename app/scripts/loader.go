@@ -31,8 +31,8 @@ var hourlyTrafficPattern = map[int]int{
 	9:  25,
 	10: 15,
 	11: 20,
-	12: 50,
-	13: 60, // Hora comida
+	12: 50, // Hora comida
+	13: 60, // Hora pico
 	14: 45,
 	15: 20,
 	16: 15,
@@ -50,6 +50,18 @@ const weekendMultiplier = 1.4
 var statuses = []string{"PENDING", "PREPARING", "READY", "COMPLETED", "CANCELLED"}
 var statusWeights = []int{5, 10, 5, 75, 5}
 
+type Category struct {
+	ID   int
+	Name string
+}
+
+type Product struct {
+	ID         int
+	Name       string
+	CategoryID int
+	Price      float64
+}
+
 type Order struct {
 	ID         int64
 	BranchID   int
@@ -58,6 +70,106 @@ type Order struct {
 	Status     string
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+}
+
+func seedCategories(db *sql.DB) error {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM categories").Scan(&count)
+	if err != nil {
+		return err
+	}
+
+	if count > 0 {
+		fmt.Println("📂 Categories ya existen")
+		return nil
+	}
+
+	fmt.Println("📂 Insertando categorías...")
+
+	for i := 1; i <= 10; i++ {
+		_, err := db.Exec(
+			"INSERT INTO categories (name) VALUES ($1)",
+			fmt.Sprintf("Category %d", i),
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("✅ Categories creadas")
+	return nil
+}
+
+func seedProducts(db *sql.DB) error {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM products").Scan(&count)
+	if err != nil {
+		return err
+	}
+
+	if count > 0 {
+		fmt.Println("📦 Products ya existen")
+		return nil
+	}
+
+	fmt.Println("📦 Insertando productos...")
+
+	for i := 1; i <= 200; i++ {
+		categoryID := rand.Intn(10) + 1
+		price := 10 + rand.Float64()*490
+
+		_, err := db.Exec(`
+			INSERT INTO products (name, category_id, price, is_active)
+			VALUES ($1, $2, $3, true)
+		`,
+			fmt.Sprintf("Product %d", i),
+			categoryID,
+			roundToTwoDecimals(price),
+		)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("✅ Products creados")
+	return nil
+}
+
+func generateOrderItems(tx *sql.Tx, orderID int64) error {
+	// Cada orden tendrá entre 1 y 5 productos
+	itemsCount := rand.Intn(5) + 1
+
+	for i := 0; i < itemsCount; i++ {
+		productID := rand.Intn(200) + 1
+		quantity := rand.Intn(3) + 1
+
+		var price float64
+		err := tx.QueryRow(
+			"SELECT price FROM products WHERE id = $1",
+			productID,
+		).Scan(&price)
+
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(`
+			INSERT INTO order_items (order_id, product_id, quantity, price)
+			VALUES ($1, $2, $3, $4)
+		`,
+			orderID,
+			productID,
+			quantity,
+			price,
+		)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func generateRealisticTimestamp(daysBack int) time.Time {
@@ -216,20 +328,20 @@ func verifyDataIntegrity(db *sql.DB) error {
 		fmt.Printf("     %-12s : %7d (%5.2f%%)\n", status, count, pct)
 	}
 
-	// Top 5 sucursales
+	// Top 10 sucursales
 	rows, err = db.Query(`
 		SELECT branch_id, COUNT(*) as orders, SUM(total) as revenue 
 		FROM orders 
 		GROUP BY branch_id 
 		ORDER BY orders DESC 
-		LIMIT 5
+		LIMIT 10
 	`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
-	fmt.Println("\n   Top 5 sucursales por volumen:")
+	fmt.Println("\n   Top 10 sucursales por volumen:")
 	for rows.Next() {
 		var branchID int
 		var orders int
@@ -320,6 +432,17 @@ func main() {
 	initDB()
 	defer db.Close()
 
+	// Seed base data
+	err1 := seedCategories(db)
+	if err1 != nil {
+		log.Fatalf("Error creando categorías: %v", err1)
+	}
+
+	err2 := seedProducts(db)
+	if err2 != nil {
+		log.Fatalf("Error creando productos: %v", err2)
+	}
+
 	// Verificar si ya hay datos
 	var existingCount int
 	err := db.QueryRow("SELECT COUNT(*) FROM orders").Scan(&existingCount)
@@ -351,6 +474,7 @@ func main() {
 	stmt, err := db.Prepare(`
 		INSERT INTO orders (branch_id, customer_id, total, status, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id
 	`)
 	if err != nil {
 		log.Fatalf("❌ Error preparando statement: %v", err)
@@ -374,17 +498,31 @@ func main() {
 
 		// Insertar batch
 		for _, order := range orders {
-			_, err = tx.Stmt(stmt).Exec(
+			var orderID int64
+			err = tx.Stmt(stmt).QueryRow(
 				order.BranchID,
 				order.CustomerID,
 				order.Total,
 				order.Status,
 				order.CreatedAt,
 				order.UpdatedAt,
-			)
+			).Scan(&orderID)
+			// _, err = tx.Stmt(stmt).Exec(
+			// 	order.BranchID,
+			// 	order.CustomerID,
+			// 	order.Total,
+			// 	order.Status,
+			// 	order.CreatedAt,
+			// 	order.UpdatedAt,
+			// )
 			if err != nil {
 				tx.Rollback()
 				log.Fatalf("❌ Error insertando orden: %v", err)
+			}
+			err = generateOrderItems(tx, orderID)
+			if err != nil {
+				tx.Rollback()
+				log.Fatalf("❌ Error insertando order_items: %v", err)
 			}
 		}
 
