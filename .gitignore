@@ -1,0 +1,12 @@
+# Ignore environment files
+.env
+app/.env
+
+# Binaries
+*.exe
+*.dll
+*.out
+
+# OS files
+Thumbs.db
+.DS_Store

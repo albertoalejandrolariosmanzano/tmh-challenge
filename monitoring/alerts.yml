@@ -1,0 +1,35 @@
+groups:
+  - name: api_alerts
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error rate > 5% en los últimos 5 minutos"
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 latency > 500ms"
+
+      - alert: ServiceDown
+        expr: up{job="tmh-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Servicio API no responde"
+
+      - alert: DatabaseConnectionsHigh
+        expr: pg_stat_database_numbackends / pg_settings_max_connections > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Más del 90% de conexiones DB usadas"

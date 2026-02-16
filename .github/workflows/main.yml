@@ -1,0 +1,80 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25'
+      
+      - name: Run tests
+        run: |
+          cd app
+          go test -v -cover ./...
+      
+      - name: Security Scan
+        run: |
+          docker run --rm -v $(pwd):/app aquasec/trivy:latest fs --security-checks vuln /app
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/tmh-api:${{ github.sha }} ./app
+          docker tag ${{ secrets.DOCKER_USERNAME }}/tmh-api:${{ github.sha }} ${{ secrets.DOCKER_USERNAME }}/tmh-api:latest
+      
+      - name: Push to Registry
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          docker push ${{ secrets.DOCKER_USERNAME }}/tmh-api:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/tmh-api:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Install helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      # - name: Deploy to Kubernetes
+      #   run: |
+      #     kubectl set image deployment/tmh-api api=${{ secrets.DOCKER_USERNAME }}/tmh-api:${{ github.sha }}
+      #     kubectl rollout status deployment/tmh-api
+      
+      # - name: Deploy to Kubernetes with Helm
+      #   run: |
+      #     cd infra/helm/api
+      #     helm lint .
+      #     helm upgrade --install tmh-api . --namespace tmh \
+      #       --set image.repository=${{ secrets.DOCKER_USERNAME }}/tmh-api,
+      #             image.tag=${{ github.sha }},
+      #             db_host=${{ secrets.DB_HOST }},
+      #             db_port=${{ secrets.DB_PORT }},
+      #             db_user=${{ secrets.DB_USER }},
+      #             db_password=${{ secrets.DB_PASSWORD }},
+      #             db_name=${{ secrets.DB_NAME }}

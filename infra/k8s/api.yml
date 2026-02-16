@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tmh-api
+  labels:
+    app: tmh-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tmh-api
+  template:
+    metadata:
+      labels:
+        app: tmh-api
+    spec:
+      containers:
+      - name: api
+        image: tu-usuario/tmh-api:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+        ports:
+        - containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        env:
+        - name: DB_HOST
+          value: "postgres-service"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tmh-api-service
+spec:
+  type: NodePort
+  selector:
+    app: tmh-api
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tmh-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tmh-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+    

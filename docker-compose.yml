@@ -1,0 +1,175 @@
+services:
+  # API principal
+  api:
+    build: ./app
+    container_name: tmh-api
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./app/.env:/app/.env:ro
+    env_file:
+      - ./app/.env
+    environment:
+      - DB_HOST=${DB_HOST:-postgres}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-password}
+      - DB_NAME=${DB_NAME:-tmh_db}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - PORT=${PORT:-8088}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: always  # CRÍTICO: Para failure scenarios
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - tmh-network
+
+  # PostgreSQL con health check
+  postgres:
+    image: postgres:14-alpine
+    container_name: tmh-postgres
+    env_file:
+      - ./app/.env
+    environment:
+      - POSTGRES_USER=${DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-password}
+      - POSTGRES_DB=${DB_NAME:-tmh_db}
+      - POSTGRES_INITDB_ARGS=-E UTF8
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./app/scripts/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tmh-network
+
+  # Redis para cache
+  redis:
+    image: redis:7-alpine
+    container_name: tmh-redis
+    ports:
+      - "6379:6379"
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tmh-network
+  
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/host'
+    networks:
+      - tmh-network
+  
+  # cAdvisor - recolecta métricas de contenedores
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: tmh-cadvisor
+    restart: unless-stopped
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8080:8080"  # Exporta métricas en el puerto 8080
+    privileged: true
+    networks:
+      - tmh-network
+
+  # Prometheus para métricas
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tmh-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    ports:
+      - "9090:9090"
+    restart: always
+    networks:
+      - tmh-network
+
+  # Grafana para visualización
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tmh-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
+    depends_on:
+      - prometheus
+    restart: always
+    networks:
+      - tmh-network
+
+  # Postgres Exporter para métricas de DB
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: tmh-postgres-exporter
+    env_file:
+      - ./app/.env
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-password}@${DB_HOST:-postgres}:${DB_PORT:-5432}/${DB_NAME:-tmh_db}?sslmode=disable
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres
+    restart: always
+    networks:
+      - tmh-network
+
+volumes:
+  pgdata:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  tmh-network:
+    driver: bridge
