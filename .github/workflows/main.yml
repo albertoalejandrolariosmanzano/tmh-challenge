@@ -57,24 +57,7 @@ jobs:
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
 
-      - name: Install helm
+      - name: Deploy to Kubernetes
         run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-      # - name: Deploy to Kubernetes
-      #   run: |
-      #     kubectl set image deployment/tmh-api api=${{ secrets.DOCKER_USERNAME }}/tmh-api:${{ github.sha }}
-      #     kubectl rollout status deployment/tmh-api
-      
-      # - name: Deploy to Kubernetes with Helm
-      #   run: |
-      #     cd infra/helm/api
-      #     helm lint .
-      #     helm upgrade --install tmh-api . --namespace tmh \
-      #       --set image.repository=${{ secrets.DOCKER_USERNAME }}/tmh-api,
-      #             image.tag=${{ github.sha }},
-      #             db_host=${{ secrets.DB_HOST }},
-      #             db_port=${{ secrets.DB_PORT }},
-      #             db_user=${{ secrets.DB_USER }},
-      #             db_password=${{ secrets.DB_PASSWORD }},
-      #             db_name=${{ secrets.DB_NAME }}
+          kubectl set image deployment/tmh-api api=${{ secrets.DOCKER_USERNAME }}/tmh-api:${{ github.sha }}
+          kubectl rollout status deployment/tmh-api

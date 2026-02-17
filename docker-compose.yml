@@ -45,6 +45,9 @@ services:
       - POSTGRES_PASSWORD=${DB_PASSWORD:-password}
       - POSTGRES_DB=${DB_NAME:-tmh_db}
       - POSTGRES_INITDB_ARGS=-E UTF8
+      - POSTGRES_SHARED_BUFFERS=1GB
+      - POSTGRES_WORK_MEM=32MB
+      - POSTGRES_SYNCHRONOUS_COMMIT=off
     ports:
       - "5432:5432"
     volumes:

@@ -25,13 +25,13 @@ test: ## Ejecutar tests básicos
 	@curl -s http://localhost:8088/ready || echo "❌ Readiness check falló"
 	@curl -s http://localhost:9090/-/healthy || echo "❌ Prometheus no responde"
 
-load-data: ## Cargar 500k órdenes (toma ~8-10 minutos)
+load-data: ## Cargar 500k órdenes (toma 12 segundos)
 	@echo "📦 Iniciando carga de datos..."
-	docker-compose exec api /app/scripts/loader
+	docker-compose exec api /app/scripts/loader records=500000, cat=0, p=0
 
 load-data-small: ## Cargar solo 10k órdenes (para testing rápido)
 	@echo "📦 Carga rápida de 10k registros..."
-	docker-compose exec api /app/scripts/loader 10000
+	docker-compose exec api /app/scripts/loader records=10000, cat=0, p=0
 
 db-shell: ## Abrir shell de PostgreSQL
 	docker-compose exec postgres psql -U postgres -d tmh_db
@@ -40,6 +40,8 @@ redis-shell: ## Abrir shell de Redis
 	docker-compose exec redis redis-cli
 
 db-stats: ## Ver estadísticas de la DB
+	docker-compose exec postgres psql -U postgres -d tmh_db -c "SELECT COUNT(*) as categories FROM categories;"
+	docker-compose exec postgres psql -U postgres -d tmh_db -c "SELECT COUNT(*) as products FROM products;"
 	docker-compose exec postgres psql -U postgres -d tmh_db -c "SELECT COUNT(*) as total_orders FROM orders;"
 	docker-compose exec postgres psql -U postgres -d tmh_db -c "SELECT status, COUNT(*) FROM orders GROUP BY status;"
 

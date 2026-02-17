@@ -2,29 +2,46 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: tmh-api
+  namespace: production
   labels:
     app: tmh-api
+    tier: backend
 spec:
-  replicas: 3
+  replicas: 1  # Mínimo para HA
   selector:
     matchLabels:
       app: tmh-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
         app: tmh-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: tmh-api
       containers:
       - name: api
-        image: tu-usuario/tmh-api:latest
-        imagePullPolicy: IfNotPresent
+        image: ${ECR_REGISTRY}/tmh-api:${IMAGE_TAG}
         resources:
-          limits:
-            cpu: "500m"
-            memory: "512Mi"
           requests:
-            cpu: "200m"
+            cpu: "250m"
             memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
         ports:
         - containerPort: 8080
         livenessProbe:
@@ -32,15 +49,24 @@ spec:
             path: /health
             port: 8080
           initialDelaySeconds: 15
-          periodSeconds: 20
-        env:
-        - name: DB_HOST
-          value: "postgres-service"
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        envFrom:
+        - configMapRef:
+            name: tmh-config
+        - secretRef:
+            name: tmh-secrets
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: tmh-api-service
+  namespace: production
 spec:
   type: NodePort
   selector:
@@ -53,6 +79,7 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: tmh-api-hpa
+  namespace: production
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -67,4 +94,27 @@ spec:
       target:
         type: Utilization
         averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      selectPolicy: Max
     

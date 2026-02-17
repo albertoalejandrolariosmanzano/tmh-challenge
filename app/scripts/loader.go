@@ -6,16 +6,15 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
-var (
-	db *sql.DB
-)
+var productPrices = map[int]float64{}
+var productIDs []int
 
 // Patrones de tráfico
 var hourlyTrafficPattern = map[int]int{
@@ -50,131 +49,198 @@ const weekendMultiplier = 1.4
 var statuses = []string{"PENDING", "PREPARING", "READY", "COMPLETED", "CANCELLED"}
 var statusWeights = []int{5, 10, 5, 75, 5}
 
-type Category struct {
-	ID   int
-	Name string
-}
+func main() {
+	rand.Seed(time.Now().UnixNano() + rand.Int63())
 
-type Product struct {
-	ID         int
-	Name       string
-	CategoryID int
-	Price      float64
-}
+	// ====== ARGUMENTOS ======
+	addCategories := 0
+	addProducts := 0
+	totalRecords := 500000
 
-type Order struct {
-	ID         int64
-	BranchID   int
-	CustomerID int
-	Total      float64
-	Status     string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-}
-
-func seedCategories(db *sql.DB) error {
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM categories").Scan(&count)
-	if err != nil {
-		return err
-	}
-
-	if count > 0 {
-		fmt.Println("📂 Categories ya existen")
-		return nil
-	}
-
-	fmt.Println("📂 Insertando categorías...")
-
-	for i := 1; i <= 10; i++ {
-		_, err := db.Exec(
-			"INSERT INTO categories (name) VALUES ($1)",
-			fmt.Sprintf("Category %d", i),
-		)
-		if err != nil {
-			return err
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "cat=") {
+			addCategories, _ = strconv.Atoi(strings.TrimPrefix(arg, "cat="))
+		}
+		if strings.HasPrefix(arg, "p=") {
+			addProducts, _ = strconv.Atoi(strings.TrimPrefix(arg, "p="))
+		}
+		if strings.HasPrefix(arg, "records=") {
+			totalRecords, _ = strconv.Atoi(strings.TrimPrefix(arg, "records="))
 		}
 	}
 
-	fmt.Println("✅ Categories creadas")
-	return nil
-}
+	fmt.Println("📊 Configuración:")
+	fmt.Println("   Categorías extra:", addCategories)
+	fmt.Println("   Productos extra:", addProducts)
+	fmt.Println("   Órdenes a crear:", totalRecords)
 
-func seedProducts(db *sql.DB) error {
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM products").Scan(&count)
+	db := connectDB()
+	defer db.Close()
+
+	err := ensureSeedData(db, addCategories, addProducts)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
 
-	if count > 0 {
-		fmt.Println("📦 Products ya existen")
-		return nil
+	loadProducts(db)
+
+	fmt.Printf("\n📦 Iniciando carga de %d registros...\n", totalRecords)
+	fmt.Printf("   Patrón: Tráfico realista con rush hours\n\n")
+
+	start := time.Now()
+
+	err = bulkInsertWithCopy(db, totalRecords)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	fmt.Println("📦 Insertando productos...")
+	elapsed := time.Since(start)
+	overallRate := float64(totalRecords) / elapsed.Seconds()
 
-	for i := 1; i <= 200; i++ {
-		categoryID := rand.Intn(10) + 1
-		price := 10 + rand.Float64()*490
+	fmt.Printf("\n✅ Carga completada exitosamente!\n")
+	fmt.Printf("   Tiempo total: %.2f segundos (%.2f minutos)\n", elapsed.Seconds(), elapsed.Minutes())
+	fmt.Printf("   Velocidad promedio: %.0f rows/sec\n", overallRate)
 
-		_, err := db.Exec(`
-			INSERT INTO products (name, category_id, price, is_active)
-			VALUES ($1, $2, $3, true)
-		`,
-			fmt.Sprintf("Product %d", i),
-			categoryID,
-			roundToTwoDecimals(price),
-		)
+	goalMet := elapsed < 10*time.Minute
+	goalStatus := "✅ CUMPLIDO"
+	if !goalMet {
+		goalStatus = "❌ NO CUMPLIDO"
+	}
+	fmt.Printf("   Objetivo: <10 minutos - %s\n", goalStatus)
 
-		if err != nil {
-			return err
+	// Crear índices
+	err = createIndexes(db)
+	if err != nil {
+		log.Printf("⚠️ Error creando índices: %v", err)
+	}
+
+	fmt.Println("🔧 Actualizando estadísticas...")
+	_, err = db.Exec("ANALYZE orders")
+	_, err = db.Exec("ANALYZE order_items")
+	if err != nil {
+		log.Printf("⚠️ Error actualizando estadísticas: %v", err)
+	}
+	fmt.Println("✅ Estadísticas actualizadas")
+
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("  PROCESO COMPLETADO - Ready para testing")
+	fmt.Println(strings.Repeat("=", 60) + "\n")
+}
+
+func connectDB() *sql.DB {
+
+	host := getEnv("DB_HOST", "localhost")
+	port := getEnv("DB_PORT", "5432")
+	user := getEnv("DB_USER", "postgres")
+	password := getEnv("DB_PASSWORD", "password")
+	dbname := getEnv("DB_NAME", "tmh_db")
+
+	connStr := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		host, port, user, password, dbname,
+	)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(0) // 🔥 IMPORTANTE
+	db.SetConnMaxIdleTime(0)
+
+	err = db.Ping()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return db
+}
+
+func getEnv(key, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func ensureSeedData(db *sql.DB, addCategories, addProducts int) error {
+
+	var totalCategories int
+	var categoryCount int
+	db.QueryRow("SELECT COUNT(*) FROM categories").Scan(&categoryCount)
+
+	// Si no hay categorías, crear 10 categorías base y asi addCategories se suma a estas 10,
+	// si addCategories es 0, solo se crean estas 10 categorías base
+	if categoryCount == 0 && addCategories == 0 {
+		totalCategories = 10
+		fmt.Println("📦 Creando 10 categorías base...")
+	} else if categoryCount > 0 && addCategories > 0 {
+		fmt.Printf("➕ Agregando %d categorías...\n", addCategories)
+		totalCategories = addCategories
+	} else if categoryCount == 0 && addCategories > 0 {
+		fmt.Printf("📦 Creando 10 categorías base, ➕ %d nuevas categorías\n", addCategories)
+		totalCategories = addCategories + 10
+	} else if categoryCount > 0 && addCategories == 0 {
+		totalCategories = categoryCount
+	}
+
+	if totalCategories > 0 && categoryCount != totalCategories {
+		for i := 1; i <= totalCategories; i++ {
+			db.Exec(`
+				INSERT INTO categories (name)
+				VALUES ($1)
+			`, fmt.Sprintf("Category %d", i))
 		}
+		fmt.Printf("✅ Creadas %d categorías.\n", totalCategories)
 	}
 
-	fmt.Println("✅ Products creados")
+	var productCount int
+	var totalProducts int
+	db.QueryRow("SELECT COUNT(*) FROM products").Scan(&productCount)
+
+	if productCount == 0 && addProducts == 0 {
+		totalProducts = 200
+		fmt.Println("📦 Creando 200 productos base...")
+	} else if productCount > 0 && addProducts > 0 {
+		fmt.Printf("➕ Agregando %d productos...\n", addProducts)
+		totalProducts = addProducts
+	} else if productCount == 0 && addProducts > 0 {
+		fmt.Printf("📦 Creando 200 productos base, ➕ %d nuevos productos\n", addProducts)
+		totalProducts = addProducts + 200
+	} else if productCount > 0 && addProducts == 0 {
+		totalProducts = productCount
+	}
+
+	if totalProducts > 0 && productCount != totalProducts {
+		for i := 1; i <= totalProducts; i++ {
+			db.Exec(`
+				INSERT INTO products (name, category_id, price)
+				VALUES ($1, $2, $3)
+			`, fmt.Sprintf("Product %d", i), rand.Intn(totalCategories)+1, float64(rand.Intn(5000)+500)/100)
+		}
+		fmt.Printf("✅ Creados %d productos.\n", totalProducts)
+	}
 	return nil
 }
 
-func generateOrderItems(tx *sql.Tx, orderID int64) error {
-	// Cada orden tendrá entre 1 y 5 productos
-	itemsCount := rand.Intn(5) + 1
+func loadProducts(db *sql.DB) {
+	rows, _ := db.Query("SELECT id, price FROM products")
+	defer rows.Close()
 
-	for i := 0; i < itemsCount; i++ {
-		productID := rand.Intn(200) + 1
-		quantity := rand.Intn(3) + 1
-
+	for rows.Next() {
+		var id int
 		var price float64
-		err := tx.QueryRow(
-			"SELECT price FROM products WHERE id = $1",
-			productID,
-		).Scan(&price)
-
-		if err != nil {
-			return err
-		}
-
-		_, err = tx.Exec(`
-			INSERT INTO order_items (order_id, product_id, quantity, price)
-			VALUES ($1, $2, $3, $4)
-		`,
-			orderID,
-			productID,
-			quantity,
-			price,
-		)
-
-		if err != nil {
-			return err
-		}
+		rows.Scan(&id, &price)
+		productPrices[id] = price
+		productIDs = append(productIDs, id)
 	}
-
-	return nil
 }
 
 func generateRealisticTimestamp(daysBack int) time.Time {
 	// Fecha aleatoria
-	rand.Seed(time.Now().UnixNano() + rand.Int63())
 	baseDate := time.Now().AddDate(0, 0, -rand.Intn(daysBack))
 
 	// Aplicar patrón horario
@@ -217,45 +283,6 @@ func weightedRandomChoice(items []int, weights []int) int {
 	return items[0]
 }
 
-func generateBatch(size int) []Order {
-	orders := make([]Order, size)
-
-	for i := range size {
-		// Branch ID (1-100)
-		branchID := rand.Intn(100) + 1
-		customerID := rand.Intn(10000) + 1
-
-		// Total realista
-		var total float64
-		r := rand.Float64()
-		switch {
-		case r < 0.7: // 70% de probabilidad (r entre 0.0 y 0.6999)
-			total = 50.0 + rand.Float64()*250.0 // 50-300
-		case r < 0.9: // 20% de probabilidad (r entre 0.7 y 0.8999)
-			total = 300.0 + rand.Float64()*500.0 // 300-800
-		default: // 10% de probabilidad (r entre 0.9 y 1.0)
-			total = 800.0 + rand.Float64()*1200.0 // 800-2000
-		}
-
-		// Status con pesos
-		status := weightedRandomChoiceString(statuses, statusWeights)
-
-		createdAt := generateRealisticTimestamp(180)
-
-		orders[i] = Order{
-			ID:         0,
-			BranchID:   branchID,
-			CustomerID: customerID,
-			Total:      roundToTwoDecimals(total),
-			Status:     status,
-			CreatedAt:  createdAt,
-			UpdatedAt:  createdAt,
-		}
-	}
-
-	return orders
-}
-
 func weightedRandomChoiceString(items []string, weights []int) string {
 	total := 0
 	for _, w := range weights {
@@ -273,8 +300,151 @@ func weightedRandomChoiceString(items []string, weights []int) string {
 	return items[0]
 }
 
-func roundToTwoDecimals(value float64) float64 {
-	return float64(int(value*100)) / 100
+func bulkInsertWithCopy(db *sql.DB, total int) error {
+
+	if len(productIDs) == 0 {
+		return fmt.Errorf("no hay productos cargados en memoria")
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+
+	// Obtener último ID
+	var lastID int64
+	err = tx.QueryRow(`SELECT COALESCE(MAX(id),0) FROM orders`).Scan(&lastID)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	currentID := lastID
+
+	// ===============================
+	// 1️⃣ COPY ORDERS
+	// ===============================
+
+	orderStmt, err := tx.Prepare(pq.CopyIn(
+		"orders",
+		"id",
+		"branch_id", "customer_id", "total",
+		"status", "created_at", "updated_at",
+	))
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	type orderItem struct {
+		orderID   int64
+		productID int
+		quantity  int
+		price     float64
+	}
+
+	var itemsBuffer []orderItem
+
+	for i := 0; i < total; i++ {
+
+		currentID++
+
+		branchID := rand.Intn(10) + 1
+		customerID := rand.Intn(10000) + 1
+		status := weightedRandomChoiceString(statuses, statusWeights)
+		created := generateRealisticTimestamp(180)
+
+		itemsCount := rand.Intn(5) + 1
+		var totalAmount float64
+
+		for j := 0; j < itemsCount; j++ {
+			productID := productIDs[rand.Intn(len(productIDs))]
+			quantity := rand.Intn(3) + 1
+			price := productPrices[productID]
+
+			totalAmount += price * float64(quantity)
+
+			itemsBuffer = append(itemsBuffer, orderItem{
+				orderID:   currentID,
+				productID: productID,
+				quantity:  quantity,
+				price:     price,
+			})
+		}
+
+		_, err = orderStmt.Exec(
+			currentID,
+			branchID,
+			customerID,
+			totalAmount,
+			status,
+			created,
+			created,
+		)
+		if err != nil {
+			orderStmt.Close()
+			tx.Rollback()
+			return err
+		}
+	}
+
+	_, err = orderStmt.Exec()
+	if err != nil {
+		orderStmt.Close()
+		tx.Rollback()
+		return err
+	}
+
+	orderStmt.Close()
+
+	// ===============================
+	// 2️⃣ COPY ORDER_ITEMS
+	// ===============================
+
+	itemStmt, err := tx.Prepare(pq.CopyIn(
+		"order_items",
+		"order_id", "product_id", "quantity", "price",
+	))
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	for _, item := range itemsBuffer {
+		_, err = itemStmt.Exec(
+			item.orderID,
+			item.productID,
+			item.quantity,
+			item.price,
+		)
+		if err != nil {
+			itemStmt.Close()
+			tx.Rollback()
+			return err
+		}
+	}
+
+	_, err = itemStmt.Exec()
+	if err != nil {
+		itemStmt.Close()
+		tx.Rollback()
+		return err
+	}
+
+	itemStmt.Close()
+
+	err = tx.Commit()
+	if err != nil {
+		return err
+	}
+
+	// Ajustar secuencia
+	_, err = db.Exec(`
+		SELECT setval(pg_get_serial_sequence('orders','id'),
+		(SELECT MAX(id) FROM orders))
+	`)
+
+	return err
 }
 
 func createIndexes(db *sql.DB) error {
@@ -290,291 +460,10 @@ func createIndexes(db *sql.DB) error {
 	for _, idxSQL := range indexes {
 		_, err := db.Exec(idxSQL)
 		if err != nil {
-			return fmt.Errorf("error creando índice: %v", err)
+			return fmt.Errorf("Error creando índice: %v", err)
 		}
 	}
 
 	fmt.Println("✅ Índices creados")
 	return nil
-}
-
-func verifyDataIntegrity(db *sql.DB) error {
-	fmt.Println("\n🔍 Verificando integridad de datos...")
-
-	// Total de registros
-	var total int
-	err := db.QueryRow("SELECT COUNT(*) FROM orders").Scan(&total)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("   Total registros: %d\n", total)
-
-	// Distribución por status
-	rows, err := db.Query("SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY status")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	fmt.Println("\n   Distribución por status:")
-	for rows.Next() {
-		var status string
-		var count int
-		err := rows.Scan(&status, &count)
-		if err != nil {
-			return err
-		}
-		pct := float64(count) / float64(total) * 100
-		fmt.Printf("     %-12s : %7d (%5.2f%%)\n", status, count, pct)
-	}
-
-	// Top 10 sucursales
-	rows, err = db.Query(`
-		SELECT branch_id, COUNT(*) as orders, SUM(total) as revenue 
-		FROM orders 
-		GROUP BY branch_id 
-		ORDER BY orders DESC 
-		LIMIT 10
-	`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	fmt.Println("\n   Top 10 sucursales por volumen:")
-	for rows.Next() {
-		var branchID int
-		var orders int
-		var revenue float64
-		err := rows.Scan(&branchID, &orders, &revenue)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("     Sucursal %3d : %5d órdenes - $%.2f\n", branchID, orders, revenue)
-	}
-
-	// Distribución por hora
-	rows, err = db.Query(`
-		SELECT EXTRACT(HOUR FROM created_at) as hour, COUNT(*) 
-		FROM orders 
-		GROUP BY hour 
-		ORDER BY hour
-	`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	fmt.Println("\n   Distribución por hora del día:")
-	for rows.Next() {
-		var hour int
-		var count int
-		err := rows.Scan(&hour, &count)
-		if err != nil {
-			return err
-		}
-		barCount := count / 2000
-		bar := ""
-		for i := 0; i < barCount && i < 50; i++ {
-			bar += "█"
-		}
-		fmt.Printf("%02d:00 - %6d %s\n", hour, count, bar)
-	}
-
-	return nil
-}
-
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-func initDB() {
-	var err error
-	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-		getEnv("DB_USER", "postgres"),
-		getEnv("DB_PASSWORD", "password"),
-		getEnv("DB_HOST", "postgres"),
-		getEnv("DB_PORT", "5432"),
-		getEnv("DB_NAME", "tmh_db"),
-	)
-
-	db, err = sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatalf("Error conectando a DB: %v", err)
-	}
-
-	// Verificar conexión
-	if err = db.Ping(); err != nil {
-		log.Fatalf("Error al hacer ping a DB: %v", err)
-	}
-	log.Println("✅ Conectado a PostgreSQL")
-}
-
-func main() {
-	fmt.Println("=" + strings.Repeat("=", 59))
-	fmt.Println("  CARGA MASIVA DE DATOS - TMH Challenge")
-	fmt.Println("=" + strings.Repeat("=", 59))
-
-	// Leer argumentos
-	records := 500000
-	if len(os.Args) > 1 {
-		fmt.Sscanf(os.Args[1], "%d", &records)
-	}
-
-	if err := godotenv.Load("/app/.env"); err != nil {
-		log.Println("No .env file found, continuing with environment variables or defaults")
-	} else {
-		log.Println("Loaded .env file")
-	}
-	initDB()
-	defer db.Close()
-
-	// Seed base data
-	err1 := seedCategories(db)
-	if err1 != nil {
-		log.Fatalf("Error creando categorías: %v", err1)
-	}
-
-	err2 := seedProducts(db)
-	if err2 != nil {
-		log.Fatalf("Error creando productos: %v", err2)
-	}
-
-	// Verificar si ya hay datos
-	var existingCount int
-	err := db.QueryRow("SELECT COUNT(*) FROM orders").Scan(&existingCount)
-	if err != nil {
-		log.Fatalf("❌ Error verificando datos existentes: %v", err)
-	}
-
-	if existingCount > 0 {
-		fmt.Printf("\n⚠️  Ya existen %d registros en la tabla.\n", existingCount)
-		fmt.Print("¿Deseas continuar agregando más? (s/n): ")
-		var response string
-		fmt.Scanln(&response)
-		if response != "s" && response != "S" {
-			fmt.Println("Operación cancelada.")
-			return
-		}
-	}
-
-	totalRows := records
-	batchSize := 5000
-
-	fmt.Printf("\n📦 Iniciando carga de %d registros...\n", totalRows)
-	fmt.Printf("   Batch size: %d\n", batchSize)
-	fmt.Printf("   Patrón: Tráfico realista con rush hours\n\n")
-
-	startTime := time.Now()
-
-	// Preparar statement para inserción (omitimos `id` para que SERIAL lo genere)
-	stmt, err := db.Prepare(`
-		INSERT INTO orders (branch_id, customer_id, total, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id
-	`)
-	if err != nil {
-		log.Fatalf("❌ Error preparando statement: %v", err)
-	}
-	defer stmt.Close()
-
-	for i := 0; i < totalRows; i += batchSize {
-		batchStart := time.Now()
-		currentBatchSize := batchSize
-		if i+batchSize > totalRows {
-			currentBatchSize = totalRows - i
-		}
-
-		orders := generateBatch(currentBatchSize)
-
-		// Iniciar transacción
-		tx, err := db.Begin()
-		if err != nil {
-			log.Fatalf("❌ Error iniciando transacción: %v", err)
-		}
-
-		// Insertar batch
-		for _, order := range orders {
-			var orderID int64
-			err = tx.Stmt(stmt).QueryRow(
-				order.BranchID,
-				order.CustomerID,
-				order.Total,
-				order.Status,
-				order.CreatedAt,
-				order.UpdatedAt,
-			).Scan(&orderID)
-			// _, err = tx.Stmt(stmt).Exec(
-			// 	order.BranchID,
-			// 	order.CustomerID,
-			// 	order.Total,
-			// 	order.Status,
-			// 	order.CreatedAt,
-			// 	order.UpdatedAt,
-			// )
-			if err != nil {
-				tx.Rollback()
-				log.Fatalf("❌ Error insertando orden: %v", err)
-			}
-			err = generateOrderItems(tx, orderID)
-			if err != nil {
-				tx.Rollback()
-				log.Fatalf("❌ Error insertando order_items: %v", err)
-			}
-		}
-
-		// Commit transacción
-		err = tx.Commit()
-		if err != nil {
-			log.Fatalf("❌ Error en commit: %v", err)
-		}
-
-		batchDuration := time.Since(batchStart)
-		progress := float64(i+currentBatchSize) / float64(totalRows) * 100
-		rate := float64(currentBatchSize) / batchDuration.Seconds()
-
-		fmt.Printf("   [%5.1f%%] Insertados %7d / %d - %.0f rows/sec - Batch: %.2fs\n",
-			progress, i+currentBatchSize, totalRows, rate, batchDuration.Seconds())
-	}
-
-	duration := time.Since(startTime)
-	overallRate := float64(totalRows) / duration.Seconds()
-
-	fmt.Printf("\n✅ Carga completada exitosamente!\n")
-	fmt.Printf("   Tiempo total: %.2f segundos (%.2f minutos)\n", duration.Seconds(), duration.Minutes())
-	fmt.Printf("   Velocidad promedio: %.0f rows/sec\n", overallRate)
-
-	goalMet := duration < 10*time.Minute
-	goalStatus := "✅ CUMPLIDO"
-	if !goalMet {
-		goalStatus = "❌ NO CUMPLIDO"
-	}
-	fmt.Printf("   Objetivo: <10 minutos - %s\n", goalStatus)
-
-	// Crear índices
-	err = createIndexes(db)
-	if err != nil {
-		log.Printf("⚠️ Error creando índices: %v", err)
-	}
-
-	// Verificar integridad
-	err = verifyDataIntegrity(db)
-	if err != nil {
-		log.Printf("⚠️ Error verificando integridad: %v", err)
-	}
-
-	// Actualizar estadísticas
-	fmt.Println("\n🔧 Actualizando estadísticas de la base de datos...")
-	_, err = db.Exec("ANALYZE orders")
-	if err != nil {
-		log.Printf("⚠️ Error actualizando estadísticas: %v", err)
-	}
-	fmt.Println("✅ Estadísticas actualizadas")
-
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("  PROCESO COMPLETADO - Ready para testing")
-	fmt.Println(strings.Repeat("=", 60) + "\n")
 }
