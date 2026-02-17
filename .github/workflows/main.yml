@@ -51,13 +51,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
       - name: Install kubectl
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
 
-      - name: Deploy to Kubernetes
+      - name: Update image and deploy
         run: |
-          kubectl set image deployment/tmh-api api=${{ secrets.DOCKER_USERNAME }}/tmh-api:${{ github.sha }}
+          # Actualizar la imagen en el YAML
+          cd infra/k8s
+          yq eval '.spec.template.spec.containers[0].image = "${{ secrets.DOCKER_USERNAME }}/tmh-api:${{ github.sha }}"' -i api.yml
+
+          # Aplicar todo
+          kubectl apply -f api.yml
+          
+          # Verificar
           kubectl rollout status deployment/tmh-api
