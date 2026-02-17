@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -61,6 +62,12 @@ var (
 	)
 )
 
+const (
+	orderStream   = "orders_stream"
+	orderGroup    = "order_group"
+	orderConsumer = "worker-1"
+)
+
 type Order struct {
 	ID         int       `json:"id"`
 	BranchID   int       `json:"branch_id"`
@@ -83,6 +90,21 @@ var (
 	rdb *redis.Client
 	ctx = context.Background()
 )
+
+var orderQueueKey = "orders_queue" // buffer interno
+
+func ensureStreamGroup() {
+	if rdb == nil {
+		return
+	}
+
+	err := rdb.XGroupCreateMkStream(ctx, orderStream, orderGroup, "$").Err()
+	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+		log.Fatalf("Error creando consumer group: %v", err)
+	}
+
+	log.Println("✅ Redis Stream y Consumer Group listos")
+}
 
 func initDB() {
 	var err error
@@ -136,6 +158,8 @@ func main() {
 	initDB()
 	defer db.Close()
 	initRedis()
+	ensureStreamGroup()
+	startRedisStreamWorker()
 
 	r := mux.NewRouter()
 	r.Use(metricsMiddleware)
@@ -197,24 +221,29 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	start := time.Now()
-	query := `INSERT INTO orders (branch_id, customer_id, total, status, created_at, updated_at)
-              VALUES ($1, $2, $3, 'PENDING', NOW(), NOW()) RETURNING id, created_at, updated_at`
-
-	err := db.QueryRow(query, order.BranchID, order.CustomerID, order.Total).Scan(
-		&order.ID, &order.CreatedAt, &order.UpdatedAt,
-	)
-	dbQueryDuration.WithLabelValues("insert").Observe(time.Since(start).Seconds())
-
-	if err != nil {
-		log.Printf("Error creando orden: %v", err)
-		respondError(w, http.StatusInternalServerError, "Database error")
+	if rdb == nil {
+		respondError(w, http.StatusServiceUnavailable, "Queue unavailable")
 		return
 	}
 
-	order.Status = "PENDING"
-	ordersCreatedTotal.WithLabelValues(strconv.Itoa(order.BranchID)).Inc()
-	respondJSON(w, http.StatusCreated, order)
+	data, _ := json.Marshal(order)
+
+	err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: orderStream,
+		Values: map[string]interface{}{
+			"data": data,
+		},
+	}).Err()
+
+	if err != nil {
+		log.Printf("Error agregando a stream: %v", err)
+		respondError(w, http.StatusInternalServerError, "Queue error")
+		return
+	}
+
+	respondJSON(w, http.StatusAccepted, map[string]string{
+		"status": "Order accepted",
+	})
 }
 
 // GET /api/v1/orders/:id - Obtener orden por ID (con cache)
@@ -416,12 +445,80 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
+// Worker para procesar órdenes desde Redis Stream
+func startRedisStreamWorker() {
+	go func() {
+		log.Println("🔄 Redis Stream Worker iniciado")
+
+		for {
+			if rdb == nil {
+				time.Sleep(3 * time.Second)
+				continue
+			}
+
+			streams, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    orderGroup,
+				Consumer: orderConsumer,
+				Streams:  []string{orderStream, ">"},
+				Count:    1,
+				Block:    0,
+			}).Result()
+
+			if err != nil {
+				log.Printf("Error leyendo stream: %v", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			for _, stream := range streams {
+				for _, message := range stream.Messages {
+
+					raw := message.Values["data"].(string)
+
+					var order Order
+					if err := json.Unmarshal([]byte(raw), &order); err != nil {
+						log.Printf("Error deserializando orden: %v", err)
+						continue
+					}
+
+					err = insertOrderToDB(&order)
+					if err != nil {
+						log.Printf("⚠️ DB caída, no se hace ACK. Reintentará...")
+						continue
+					}
+
+					// ACK solo si insertó bien
+					rdb.XAck(ctx, orderStream, orderGroup, message.ID)
+					log.Printf("✅ Orden procesada y ACK enviada (%s)", message.ID)
+				}
+			}
+		}
+	}()
+}
+
+// Inserta la orden en la DB y actualiza el struct con ID y timestamps generados
+func insertOrderToDB(order *Order) error {
+	query := `INSERT INTO orders 
+		(branch_id, customer_id, total, status, created_at, updated_at)
+		VALUES ($1, $2, $3, 'PENDING', NOW(), NOW())
+		RETURNING id, created_at, updated_at`
+
+	return db.QueryRow(
+		query,
+		order.BranchID,
+		order.CustomerID,
+		order.Total,
+	).Scan(&order.ID, &order.CreatedAt, &order.UpdatedAt)
+}
+
+// Helpers para respuestas JSON
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
 }
 
+// Respuesta de error con formato JSON
 func respondError(w http.ResponseWriter, status int, message string) {
 	respondJSON(w, status, map[string]string{"error": message})
 }

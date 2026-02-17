@@ -1,16 +1,6 @@
 -- Top 10 productos por sucursal en el último mes
 EXPLAIN ANALYZE
-SELECT 
-    o.branch_id,
-    p.name,
-    SUM(oi.quantity * oi.price) AS total_sales
-FROM orders o
-JOIN order_items oi ON o.id = oi.order_id
-JOIN products p ON p.id = oi.product_id
-WHERE o.created_at >= NOW() - INTERVAL '1 month'
-GROUP BY o.branch_id, p.name
-ORDER BY total_sales DESC
-LIMIT 10;
+SELECT o.branch_id, p.name, SUM(oi.quantity * oi.price) AS total_sales ROM orders o JOIN order_items oi ON o.id = oi.order_id JOIN products p ON p.id = oi.product_id WHERE o.created_at >= NOW() - INTERVAL '1 month' GROUP BY o.branch_id, p.name ORDER BY total_sales DESC LIMIT 10;
 
 -- Análisis de tendencias por hora del día
 EXPLAIN ANALYZE
