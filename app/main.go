@@ -93,6 +93,12 @@ var (
 
 var orderQueueKey = "orders_queue" // buffer interno
 
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+// Asegura que el Stream y Consumer Group existan al iniciar la app
 func ensureStreamGroup() {
 	if rdb == nil {
 		return
@@ -106,6 +112,7 @@ func ensureStreamGroup() {
 	log.Println("✅ Redis Stream y Consumer Group listos")
 }
 
+// Inicializa la conexión a PostgreSQL y verifica que esté disponible
 func initDB() {
 	var err error
 	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
@@ -133,6 +140,7 @@ func initDB() {
 	log.Println("✅ Conectado a PostgreSQL")
 }
 
+// Inicializa Redis y verifica conexión
 func initRedis() {
 	rdb = redis.NewClient(&redis.Options{
 		Addr:     getEnv("REDIS_HOST", "redis") + ":" + getEnv("REDIS_PORT", "6379"),
@@ -148,6 +156,7 @@ func initRedis() {
 	}
 }
 
+// Entry point
 func main() {
 	// Cargar variables desde un archivo .env si existe (útil en desarrollo)
 	if err := godotenv.Load("./.env"); err != nil {
@@ -170,7 +179,9 @@ func main() {
 	r.HandleFunc("/api/v1/orders", listOrders).Methods("GET")
 	r.HandleFunc("/api/v1/orders/{id}/status", updateOrderStatus).Methods("PATCH")
 	r.HandleFunc("/api/v1/orders/{id}", deleteOrder).Methods("DELETE")
+
 	r.HandleFunc("/api/v1/analytics/stats", getAnalyticsStats).Methods("GET")
+	r.HandleFunc("/api/v1/analytics/query-performance", getQueryPerformance).Methods("GET")
 
 	// Health Checks
 	r.HandleFunc("/health", healthCheck).Methods("GET")
@@ -203,11 +214,7 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
+// Override WriteHeader para capturar el status code
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
@@ -302,7 +309,7 @@ func listOrders(w http.ResponseWriter, r *http.Request) {
 	if page < 1 {
 		page = 1
 	}
-	limit := 50
+	limit := 100
 	offset := (page - 1) * limit
 
 	start := time.Now()
@@ -423,6 +430,30 @@ func getAnalyticsStats(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, stats)
 }
 
+// GET /api/v1/analytics/query-performance - Mostrar EXPLAIN ANALYZE de una query demo
+func getQueryPerformance(w http.ResponseWriter, r *http.Request) {
+	query := "EXPLAIN ANALYZE SELECT count(*) FROM orders WHERE total > 100"
+	rows, err := db.Query(query)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+
+	var plan []string
+	for rows.Next() {
+		var line string
+		rows.Scan(&line)
+		plan = append(plan, line)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"explained_query": query,
+		"execution_plan":  plan,
+		"source":          "Read Replica",
+	})
+}
+
 // GET /health - Health check básico
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -456,44 +487,76 @@ func startRedisStreamWorker() {
 				continue
 			}
 
+			// Primero intentar procesar mensajes pendientes
+			messages, _, err := rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+				Stream:   orderStream,
+				Group:    orderGroup,
+				Consumer: orderConsumer,
+				MinIdle:  10 * time.Second, // tiempo mínimo sin ACK
+				Start:    "0",
+				Count:    10,
+			}).Result()
+
+			if err != nil && err != redis.Nil {
+				log.Printf("Error en XAutoClaim: %v", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			processMessages(messages)
+
+			// 📥 2️⃣ Leer mensajes nuevos
 			streams, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 				Group:    orderGroup,
 				Consumer: orderConsumer,
 				Streams:  []string{orderStream, ">"},
-				Count:    1,
-				Block:    0,
+				Count:    10,
+				Block:    5 * time.Second,
 			}).Result()
 
-			if err != nil {
-				log.Printf("Error leyendo stream: %v", err)
+			if err != nil && err != redis.Nil {
+				log.Printf("Error leyendo nuevos: %v", err)
 				time.Sleep(2 * time.Second)
 				continue
 			}
 
 			for _, stream := range streams {
-				for _, message := range stream.Messages {
-
-					raw := message.Values["data"].(string)
-
-					var order Order
-					if err := json.Unmarshal([]byte(raw), &order); err != nil {
-						log.Printf("Error deserializando orden: %v", err)
-						continue
-					}
-
-					err = insertOrderToDB(&order)
-					if err != nil {
-						log.Printf("⚠️ DB caída, no se hace ACK. Reintentará...")
-						continue
-					}
-
-					// ACK solo si insertó bien
-					rdb.XAck(ctx, orderStream, orderGroup, message.ID)
-					log.Printf("✅ Orden procesada y ACK enviada (%s)", message.ID)
-				}
+				processMessages(stream.Messages)
 			}
 		}
 	}()
+}
+
+// Procesa un batch de mensajes del Stream
+func processMessages(messages []redis.XMessage) {
+	for _, message := range messages {
+
+		raw, ok := message.Values["data"].(string)
+		if !ok {
+			log.Println("Formato inválido en mensaje")
+			continue
+		}
+
+		var order Order
+		if err := json.Unmarshal([]byte(raw), &order); err != nil {
+			log.Printf("Error deserializando: %v", err)
+			continue
+		}
+
+		err := insertOrderToDB(&order)
+		if err != nil {
+			log.Printf("⚠️ Error insertando en DB, no se hace ACK")
+			continue
+		}
+
+		err = rdb.XAck(ctx, orderStream, orderGroup, message.ID).Err()
+		if err != nil {
+			log.Printf("Error enviando ACK: %v", err)
+			continue
+		}
+
+		log.Printf("✅ Orden procesada y ACK enviada (%s)", message.ID)
+	}
 }
 
 // Inserta la orden en la DB y actualiza el struct con ID y timestamps generados
